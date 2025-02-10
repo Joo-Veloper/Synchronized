@@ -18,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 @SpringBootTest
 class InventoryServiceTest {
     @Autowired
-    private InventoryService inventoryService;
+    private PessimisticLockInventoryService inventoryService;
 
     @Autowired
     private InventoryRepository inventoryRepository;

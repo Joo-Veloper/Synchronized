@@ -108,3 +108,88 @@ public void decrease(Long id, Long quantity) throws InterruptedException {
 ```
 - 예외가 발생하면 50ms 기다렸다가 다시 시도(이렇게 만들면 충돌이 발생하도 여러번 시도해서 성공할 가능성이 높아집니다.)
 - Pessimistic Lock 은 처음부터 다른 트랜잭션을 막아비리지만 Optimistic Lock 은 트랜잭션이 실패하면 다시 시도합니다.
+
+### Named Lock(네임드 락)
+네임드 락은 MySQL에서 제공하는 데이터베이스 수준의 락 기능 중 하나로 특정 이름(문자열)을 기반으로 락을 걸고 해제하는 방식입니다.
+
+네임드 락을 사용하려면 하나의 특정 리소스(ex : 특정 상품 ID)를 대상으로 락을 적용하여 동시성 문제를 방지할 수 있습니다.
+
+### 네임드 락 핵심
+`GET_LOCK('key', timeout)`
+- key(문자열)을 기준으로 락을 설정하고, timeout(초) 동안 락이 해제되기를 기다립니다.
+- 락이 걸리면 1을 반환, 실패하면 0을 반환
+`RELEASE_LOCK('key')`
+- 해당 key의 락을 해제
+- 락을 해제하면 다른 프로세스가 이 리소스를 사용할 수 있습니다.
+네임드 락은 트랜잭션과 무관하게 동작합니다.
+- 즉, 트랜잭션이 롤백되더라도 락이 유지되므로 반드시 해제해야 합니다.
+
+### 네임드 락을 사용하는 이유
+##### 기본 방법(synchronized, PESSIMISTIC_LOCK)의 한계
+1. synchronized : JVM 내에서만 동작 -> 멀티 인스턴스 환경에서는 락을 보장할 수 없음.
+2. PESSIMISTIC_LOCK : 트랜잭션 내에서만 유효 -> 트랜잭션이 길어지면 락 점유 시간이 증가하여 성능 저하 발생
+3. OPTIMISTIC_LOCK : 충돌 발생 시 재시도 필요 -> 고객 경험(UX)가 나빠질 수 있음
+네임드 락을 사용하면, 멀티 인스턴스 환경에서도 락을 적용할 수 있으며, 트랜잭션 범위를 벗어나도 락이 유지될 수 있습니다.
+
+### 네임드 락 적용 (NamedLockInventoryFacade)
+
+```java
+@Component
+@AllArgsConstructor
+public class NamedLockInventoryFacade {
+    private final LockRepository lockRepository;
+    private final InventoryService inventoryService;
+
+    public void decrease(Long id, Long quantity) {
+        try {
+            lockRepository.getLock(id.toString()); // 🔒 해당 id에 대한 네임드 락을 획득.
+            inventoryService.decrease(id, quantity); //상품 재고 감소 로직 실행.
+        } finally {
+            lockRepository.releaseLock(id.toString()); // 🔓 락 해제 락을 해제하여 다른 요청이 접근할 수 있도록 함.
+        }
+    }
+}
+```
+
+### LockRepository()
+```java
+public interface LockRepository extends JpaRepository<Inventory, Long> {
+    @Query(value = "SELECT GET_LOCK(:key, 3000)", nativeQuery = true) // key(상품 ID)로 락을 설정하고 최대 3초 동안 기다림.
+    void getLock(String key);
+
+    @Query(value = "SELECT RELEASE_LOCK(:key)", nativeQuery = true) //해당 key에 대한 락을 해제.
+    void releaseLock(String key);
+}
+```
+
+### InventoryService (재고 감소 로직)
+```java
+@Service
+@AllArgsConstructor
+public class InventoryService {
+    private final InventoryRepository inventoryRepository;
+
+    /*트랜잭션 설정 (@Transactional(propagation = Propagation.REQUIRES_NEW))
+    별도의 새로운 트랜잭션을 생성하여 실행 → 락이 오래 유지되지 않도록 함.
+    트랜잭션이 실패해도 네임드 락은 유지되므로 반드시 releaseLock()을 호출해야 함.*/
+    @Transactional(propagation = Propagation.REQUIRES_NEW) 
+    public void decrease(Long id, Long quantity) {
+        Inventory inventory = inventoryRepository.findById(id).orElseThrow();
+        inventory.decrease(quantity);
+
+        inventoryRepository.save(inventory);
+    }
+}
+
+```
+
+### 네임드 락의 장점과 주의점
+장점
+1. 멀티 인스턴스 환경에서도 동작 - synchronized 는 JVM 내에서만 동작하지만, 네임드 락은 DB 기반이라 여러 서버에서도 공유 가능
+2. 트랜잭션과 독립적으로 사용 가능 - PESSIMISTIC_LOCK 은 트랜잭션이 길어질 경우 성능 저하가 발생하지만, 네임드 락은 별도 관리 가능
+3. 재고 관리, 예약 시스템 등에서 유용 - 특정 리소스(상품 ID 둥)에 대한 경쟁 조건을 방지할 때 사용 가능
+
+주의점
+1. 락을 반드시 해제해야 함 - 트랜잭션이 종료되더라도 네임드 락은 자동 해제되지 않음, 따라 finally 블록에서 releaseLock()을 호출
+2. 락 점유 시간이 길어지면 성능 저하 기능 - GET_LOCK(:key, timeout)에서 timeout을 적절하게 설정해야 합니다. , timeout 을 너무 길게 잡으면 시스템이 멈추는 것처럼 보일 수 있음
+3. 트랜잭션 롤백과 별개로 동작 - inventoryService.decrease()에서 예외가 발생하면 트랜잭션은 롤백되지만 네임드 락은 유지됨, 따라서 releaseLock()을 호출하지 않으면 다른 요청이 영원히 블록될 수 있습니다.

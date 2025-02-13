@@ -193,3 +193,87 @@ public class InventoryService {
 1. 락을 반드시 해제해야 함 - 트랜잭션이 종료되더라도 네임드 락은 자동 해제되지 않음, 따라 finally 블록에서 releaseLock()을 호출
 2. 락 점유 시간이 길어지면 성능 저하 기능 - GET_LOCK(:key, timeout)에서 timeout을 적절하게 설정해야 합니다. , timeout 을 너무 길게 잡으면 시스템이 멈추는 것처럼 보일 수 있음
 3. 트랜잭션 롤백과 별개로 동작 - inventoryService.decrease()에서 예외가 발생하면 트랜잭션은 롤백되지만 네임드 락은 유지됨, 따라서 releaseLock()을 호출하지 않으면 다른 요청이 영원히 블록될 수 있습니다.
+
+redis 를 활용한 방법은 MYSQL의 NamedLock 와 비슷합니다.
+다른 점으로는 Redis를 이용한다는 점과 Session 관리에 신경을 안써도 된다는 점입니다.
+
+# Redis
+redis를 활용한 방법은 MySQL의 NamedLock과 비슷합니다. 다른점은 Redis를 이용한다는 점과 Session 관리에 신경을 안써도 된다는 점입니다.
+
+### Lettuce란?
+Lettuce는 Spring에서 Redis와 통신할 때 사용하는 클라이언트 라이브러리 중 하나입니다. 쉽게 말하면 Spring과 Redis가 데이터를 주고받을 수 있도록 도와주는 도구라고 할 수 있습니다.
+ 
+### Lettuce를 사용하면 좋은 경우
+💡 그냥 캐싱만 한다고 가정하면 Jedis도 괜찮다 하지만 멀티스레드, 높은 트래픽, 동시성 처리가 필요할 때는 Lettuce를 사용합니다.
+
+---
+1. 비동기 & 높은 성능이 필요한 경우 (Lettuce 는 비동기 방식으로 동작할 수 있어서, 성능이 뛰어나고 확장성이 좋습니다.)
+    - 싱글 스레드 기반이지만, 넌블로킹 방식(요청을 기다리지 않고 다음 작업 실행)이라 빠르게 처리할 수 있습니다.
+    - 특히 트래픽이 많은 시스템에서는 Jedis보다 Lettuce가 더 효율적일 수 있습니다. </br>
+      💡언제 유용한가? -> 대규모 트래픽이 들어오는 실시간 서비스에서 유용!
+
+---
+2. .Redis 락 같은 동시성 제어가 필요할 때(Lettuce를 사용하면 Redis를 이용한 락을 쉽게 구현할 수 있다.)
+    - 여러 개의 요청이 동시에 같은 데이터를 수정하려고 할 때 한 번에 하나씩만 실행되도록 제한 가능합니다.
+    - 재고 관리 시스템이나 은행 계좌 거래 같은 경우 동시성 제어를 필수로 사용합니다
+
+
+### Code 에서 Lettuce 역활
+락은 여러개의 요청이 동시에 같은 데이터를 수정하려 할 때, 한 번에 하나의 요청만 처리할 수 있도록 막아주는 역할을 합니다.</br>
+Redis를 이용해서 락을 거는 이유는 분산 환경에서도 데이터 충돌 없이 안전하게 처리하기 위해서 사용합니다. 즉 여러 개의 서버가 동시에 같은 재고를 줄이려고 할 때, Lettuce를 사용한 Redis 락을 통해 한 번에 하나의 요청만 처리되도록 보장합니다.
+
+### 락을 관리하는 RedisLockRepository
+```java
+@Component
+public class RedisLockRepository {
+    private RedisTemplate<String, String> redisTemplate;
+
+    public RedisLockRepository(RedisTemplate<String, String> redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+
+    public Boolean lock(Long key) { // Redis 에 "lock"이라는 값을 저장해서 락을 건다. (setIfAbsent 사용)
+        return redisTemplate
+                .opsForValue()
+                .setIfAbsent(generateKey(key), "lock", Duration.ofMillis(3_000));
+                /* 
+                setIfAbsent는 값이 없을 때만 저장하는 함수라서, 누군가 먼저 락을 걸면 다른 요청은 락을 못 건다
+                즉, 한 번에 하나의 요청만 락을 가질 수 있도록 보장, 락의 유효 시간은 3초(3,000ms).
+                */
+    }
+
+    public Boolean unlock(Long key) { // Redis 에서 "lock" 값을 삭제해서 락을 푼다.
+        return redisTemplate.delete(generateKey(key));
+    }
+
+    private String generateKey(Long key) { // Redis 에 저장할 키 값(String)을 생성.
+        return key.toString();
+    }
+}
+```
+### 락을 이용해 재고 줄이는 LettuceLockInventoryFacade
+```java
+@Component
+public class LettuceLockInventoryFacade {
+    private RedisLockRepository redisLockRepository;
+    private InventoryService inventoryService;
+
+    public LettuceLockInventoryFacade(RedisLockRepository redisLockRepository, InventoryService inventoryService) {
+        this.redisLockRepository = redisLockRepository;
+        this.inventoryService = inventoryService;
+    }
+
+    public void decrease(Long id, Long quantity) throws InterruptedException { //특정 id의 재고를 줄이는 메서드
+        while (!redisLockRepository.lock(id)) { // 락을 걸 수 있을 때까지 100ms마다 재시도하면서 기다린다.
+            Thread.sleep(100);                  // 만약 다른 요청이 먼저 락을 걸었다면, 현재 요청은 락이 풀릴 때까지 기다려야 해.
+        }
+
+        try {
+            inventoryService.decrease(id, quantity); // 재고를 실제로 줄이는 로직 실행
+        } finally {
+            redisLockRepository.unlock(id); // 재고를 줄인 후에는 꼭 락을 해제해야 한다.
+                                            // 락을 안 풀어주면 다른 요청이 영원히 기다리게 되니까 주의!!!!!!!!
+        }
+    }
+}
+```

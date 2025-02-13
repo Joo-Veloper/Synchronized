@@ -21,6 +21,9 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     // redis
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    // redisson
+    implementation 'org.redisson:redisson-spring-boot-starter:3.40.2'
+    // WEB
     implementation 'org.springframework.boot:spring-boot-starter-web'
     //LOMBOK
     testCompileOnly 'org.projectlombok:lombok'

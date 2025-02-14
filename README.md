@@ -265,7 +265,7 @@ public class LettuceLockInventoryFacade {
 
     public void decrease(Long id, Long quantity) throws InterruptedException { //특정 id의 재고를 줄이는 메서드
         while (!redisLockRepository.lock(id)) { // 락을 걸 수 있을 때까지 100ms마다 재시도하면서 기다린다.
-            Thread.sleep(100);                  // 만약 다른 요청이 먼저 락을 걸었다면, 현재 요청은 락이 풀릴 때까지 기다려야 해.
+            Thread.sleep(100);                  // 만약 다른 요청이 먼저 락을 걸었다면, 현재 요청은 락이 풀릴 때까지 기다려야 한다.
         }
 
         try {
@@ -274,6 +274,39 @@ public class LettuceLockInventoryFacade {
             redisLockRepository.unlock(id); // 재고를 줄인 후에는 꼭 락을 해제해야 한다.
                                             // 락을 안 풀어주면 다른 요청이 영원히 기다리게 되니까 주의!!!!!!!!
         }
+    }
+}
+```
+
+### Redisson
+보통 여러 서버에서 같은 데이터를 동시에 수정하면 동시성 문제가 발생합니다. Redisson의 분산 락 기능을 사용하면, Redis를 이용해 하나의 작업만 먼저 실행되도록 제어할 수 있습니다.</br>
+쉽게 말하면 여러 사람이 동시에 같은 물건을 가져가지 않도록 도와주는 도구라고 할 수 있습니다.
+
+#### Redisson은 어떻게 순서를 정해 주나?
+Redisson은 잠금 장치(락,Lock)을 만들어서 한명씩만 처리하도록 합니다. 이걸 분산 락 이라고 합니다.
+
+##### 예시로 설명
+1. A가 과자를 집음 -> 계산대에 가서 먼저 계산 한다고 락을 겁니다.
+2. B가 계산하려고 하지만 잠깐 기다려 달라하고 락이 막아줌니다.
+3. A가 결제가 끝나면 락을 풀어줍니다.
+4. 이제 B가 결제가 가능합니다.
+
+### Code에서 Redisson
+```java
+public void decrease(Long id, Long quantity) {
+    RLock lock = redissonClient.getLock(id.toString()); // id를 키로 하는 Redis 락 객체(RLock)을 가져옴
+    try {
+        boolean available = lock.tryLock(10, 1, TimeUnit.SECONDS); //락을 시도하며 최대 10초 동안 기다리고, 락을 잡으면 1초 동안 유지
+                                                                    // 만약 락을 잡지 못하면 available이 false로 실행 X(동시에 실행되는 여러 요청이 같은 자원 변경하지 못하게 막음)
+        if (!available) {
+            System.out.println("lock획득 실패");
+            return;
+        }
+        inventoryService.decrease(id, quantity);
+    } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+    } finally {
+        lock.unlock(); // 작업이 끝나면 락 해제 (락 해제 안하면 다른 요청이 영원히 대기할 수 있음)
     }
 }
 ```
